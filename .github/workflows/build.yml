@@ -4,7 +4,9 @@ on:
   push:
     branches: [main, master]
   pull_request:
-  workflow_dispatch:jbs:
+  workflow_dispatch:
+
+jobs:
   build:
     runs-on: ubuntu-latest
     steps:
