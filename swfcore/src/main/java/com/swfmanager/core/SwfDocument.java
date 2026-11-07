@@ -40,7 +40,8 @@ public final class SwfDocument {
 
     // ---- indexing ------------------------------------------------------------------------
 
-    private static AssetType classify(int type) {
+    /** Which kind of asset a definition tag type is, or null if it isn't one. */
+    public static AssetType classify(int type) {
         switch (type) {
             case Tags.DEFINE_SHAPE:
             case Tags.DEFINE_SHAPE2:

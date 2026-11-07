@@ -22,6 +22,8 @@ final class AssetAdapter extends RecyclerView.Adapter<AssetAdapter.Holder> {
 
     interface OnClick {
         void onAsset(Asset asset);
+
+        void onAssetLong(Asset asset);
     }
 
     private final List<Asset> all = new ArrayList<>();
@@ -102,6 +104,13 @@ final class AssetAdapter extends RecyclerView.Adapter<AssetAdapter.Holder> {
             @Override
             public void onClick(View v) {
                 listener.onAsset(a);
+            }
+        });
+        h.itemView.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                listener.onAssetLong(a);
+                return true;
             }
         });
     }

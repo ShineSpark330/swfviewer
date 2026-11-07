@@ -1,10 +1,10 @@
 package com.swfmanager.app;
 
+import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
-import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
-import android.provider.OpenableColumns;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Menu;
@@ -14,8 +14,10 @@ import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
-import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.activity.result.contract.ActivityResultContract;
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
@@ -28,13 +30,12 @@ import com.swfmanager.core.Asset;
 import com.swfmanager.core.AssetType;
 import com.swfmanager.core.SwfDocument;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Opens an SWF and lists its assets with type filters and search. */
+/** Opens an SWF, lists its assets with type filters and search, and edits / saves it. */
 public class MainActivity extends AppCompatActivity {
 
     /** Chip order; types with no assets are skipped. */
@@ -44,6 +45,29 @@ public class MainActivity extends AppCompatActivity {
         AssetType.SCRIPT, AssetType.VIDEO, AssetType.OTHER
     };
 
+    /**
+     * Like the stock "open document" picker, but asks for write access (and to keep it), so that
+     * "Save over original" can work when the file's provider allows it.
+     */
+    private static final class OpenDoc extends ActivityResultContract<String[], Uri> {
+        @NonNull
+        @Override
+        public Intent createIntent(@NonNull Context context, @NonNull String[] input) {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            return i;
+        }
+
+        @Nullable
+        @Override
+        public Uri parseResult(int resultCode, @Nullable Intent intent) {
+            return resultCode == android.app.Activity.RESULT_OK && intent != null ? intent.getData() : null;
+        }
+    }
+
     private final ExecutorService exec = Executors.newSingleThreadExecutor();
     private AssetAdapter adapter;
     private TextView summary, emptyText;
@@ -51,6 +75,10 @@ public class MainActivity extends AppCompatActivity {
     private EditText search;
     private ChipGroup chips;
     private ActivityResultLauncher<String[]> openLauncher;
+    private Editing editing;
+    private OnBackPressedCallback backCallback;
+    private AssetType currentFilter;
+    private int shownRevision = -1;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -65,20 +93,29 @@ public class MainActivity extends AppCompatActivity {
         search = findViewById(R.id.search);
         chips = findViewById(R.id.chips);
 
+        editing = new Editing(this, new Editing.Listener() {
+            @Override
+            public void onChanged() {
+                refreshAfterChange();
+            }
+        });
+
         adapter = new AssetAdapter(getResources().getDisplayMetrics().density, new AssetAdapter.OnClick() {
             @Override
             public void onAsset(Asset asset) {
-                int idx = AppState.doc.assets.indexOf(asset);
-                Intent i = new Intent(MainActivity.this, PreviewActivity.class);
-                i.putExtra(PreviewActivity.EXTRA_ASSET, idx);
-                startActivity(i);
+                openPreview(asset);
+            }
+
+            @Override
+            public void onAssetLong(Asset asset) {
+                showActions(asset);
             }
         });
         RecyclerView list = findViewById(R.id.list);
         list.setLayoutManager(new LinearLayoutManager(this));
         list.setAdapter(adapter);
 
-        openLauncher = registerForActivityResult(new ActivityResultContracts.OpenDocument(), new androidx.activity.result.ActivityResultCallback<Uri>() {
+        openLauncher = registerForActivityResult(new OpenDoc(), new androidx.activity.result.ActivityResultCallback<Uri>() {
             @Override
             public void onActivityResult(Uri uri) {
                 if (uri != null) load(uri);
@@ -104,6 +141,22 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        // With unsaved edits, Back asks before throwing them away.
+        backCallback = new OnBackPressedCallback(false) {
+            @Override
+            public void handleOnBackPressed() {
+                confirmDiscard(new Runnable() {
+                    @Override
+                    public void run() {
+                        AppState.clear();
+                        backCallback.setEnabled(false);
+                        getOnBackPressedDispatcher().onBackPressed();
+                    }
+                });
+            }
+        };
+        getOnBackPressedDispatcher().addCallback(this, backCallback);
+
         if (AppState.doc != null) {
             show(AppState.doc, AppState.fileName);
         } else {
@@ -119,13 +172,50 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // The preview screen can edit too; pick up its changes.
+        if (AppState.doc != null && AppState.revision != shownRevision) refreshAfterChange();
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
         exec.shutdown();
+        editing.close();
     }
 
     private void pickFile() {
-        openLauncher.launch(new String[] {"*/*"});
+        if (AppState.dirty) {
+            confirmDiscard(new Runnable() {
+                @Override
+                public void run() {
+                    openLauncher.launch(new String[] {"*/*"});
+                }
+            });
+        } else {
+            openLauncher.launch(new String[] {"*/*"});
+        }
+    }
+
+    private void confirmDiscard(final Runnable discard) {
+        new AlertDialog.Builder(this)
+                .setTitle("Unsaved changes")
+                .setMessage("You've edited " + AppState.fileName + " but haven't saved it.")
+                .setPositiveButton("Save as…", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        editing.saveAs();
+                    }
+                })
+                .setNegativeButton("Discard changes", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        discard.run();
+                    }
+                })
+                .setNeutralButton("Cancel", null)
+                .show();
     }
 
     // ---- loading -------------------------------------------------------------------------
@@ -137,14 +227,14 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void run() {
                 try {
-                    byte[] raw = readAll(uri);
+                    byte[] raw = Io.readAll(getContentResolver(), uri);
                     final SwfDocument doc = SwfDocument.load(raw);
-                    final String name = displayName(uri);
+                    final String name = Io.displayName(getContentResolver(), uri, "movie.swf");
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
                             progress.setVisibility(View.GONE);
-                            AppState.set(doc, name);
+                            AppState.set(doc, name, uri);
                             show(doc, name);
                         }
                     });
@@ -163,51 +253,54 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private byte[] readAll(Uri uri) throws java.io.IOException {
-        try (InputStream in = getContentResolver().openInputStream(uri)) {
-            if (in == null) throw new java.io.IOException("Cannot open file");
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buf = new byte[64 * 1024];
-            int n;
-            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-            return out.toByteArray();
-        }
-    }
-
-    private String displayName(Uri uri) {
-        try (Cursor c = getContentResolver().query(uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
-            if (c != null && c.moveToFirst()) {
-                String n = c.getString(0);
-                if (n != null) return n;
-            }
-        } catch (RuntimeException ignored) {
-            // fall through to the path
-        }
-        String p = uri.getLastPathSegment();
-        return p != null ? p : "movie.swf";
-    }
-
     // ---- UI ------------------------------------------------------------------------------
 
+    private String summaryText(SwfDocument doc) {
+        return doc.headerSummary() + (AppState.dirty ? "  ·  unsaved changes" : "");
+    }
+
     private void show(SwfDocument doc, String name) {
+        shownRevision = AppState.revision;
         setTitle(name);
-        summary.setText(doc.headerSummary());
+        summary.setText(summaryText(doc));
         summary.setVisibility(View.VISIBLE);
         search.setText("");
         search.setVisibility(View.VISIBLE);
+        currentFilter = null;
         buildChips(doc);
         invalidateOptionsMenu();
         adapter.setTypeFilter(null);
         adapter.setAssets(doc.assets);
+        backCallback.setEnabled(AppState.dirty);
+        updateEmpty();
+    }
+
+    /** The document was edited, undone or saved: update the list but keep the search and filter. */
+    private void refreshAfterChange() {
+        SwfDocument doc = AppState.doc;
+        shownRevision = AppState.revision;
+        if (doc == null) return;
+        setTitle(AppState.fileName);
+        summary.setText(summaryText(doc));
+        summary.setVisibility(View.VISIBLE);
+        search.setVisibility(View.VISIBLE);
+        if (currentFilter != null && doc.count(currentFilter) == 0) {
+            currentFilter = null;
+            adapter.setTypeFilter(null);
+        }
+        buildChips(doc);
+        adapter.setAssets(doc.assets);
+        backCallback.setEnabled(AppState.dirty);
+        invalidateOptionsMenu();
         updateEmpty();
     }
 
     private void buildChips(SwfDocument doc) {
         chips.removeAllViews();
-        addChip("All (" + doc.assets.size() + ")", null, true);
+        addChip("All (" + doc.assets.size() + ")", null, currentFilter == null);
         for (AssetType t : ORDER) {
             int n = doc.count(t);
-            if (n > 0) addChip(t.label + " (" + n + ")", t, false);
+            if (n > 0) addChip(t.label + " (" + n + ")", t, t == currentFilter);
         }
         chipScroll.setVisibility(View.VISIBLE);
     }
@@ -222,7 +315,8 @@ public class MainActivity extends AppCompatActivity {
         chip.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                adapter.setTypeFilter((AssetType) v.getTag());
+                currentFilter = (AssetType) v.getTag();
+                adapter.setTypeFilter(currentFilter);
                 updateEmpty();
             }
         });
@@ -241,6 +335,39 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // ---- asset actions -------------------------------------------------------------------
+
+    private void openPreview(Asset asset) {
+        int idx = AppState.doc.assets.indexOf(asset);
+        Intent i = new Intent(this, PreviewActivity.class);
+        i.putExtra(PreviewActivity.EXTRA_ASSET, idx);
+        startActivity(i);
+    }
+
+    /** Long-press menu: preview, rename, replace, delete. */
+    private void showActions(final Asset asset) {
+        final List<String> labels = new ArrayList<>();
+        labels.add("Preview");
+        if (Editing.canRename(asset)) labels.add("Rename…");
+        if (Editing.canReplace(asset)) labels.add("Replace with file…");
+        labels.add("Delete…");
+        new AlertDialog.Builder(this)
+                .setTitle(asset.title())
+                .setItems(labels.toArray(new String[0]), new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        String l = labels.get(which);
+                        if (l.equals("Preview")) openPreview(asset);
+                        else if (l.startsWith("Rename")) editing.rename(asset);
+                        else if (l.startsWith("Replace")) editing.replace(asset);
+                        else editing.delete(asset);
+                    }
+                })
+                .show();
+    }
+
+    // ---- menu ----------------------------------------------------------------------------
+
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
         getMenuInflater().inflate(R.menu.main_menu, menu);
@@ -252,6 +379,14 @@ public class MainActivity extends AppCompatActivity {
         boolean have = AppState.doc != null;
         menu.findItem(R.id.action_play).setVisible(have);
         menu.findItem(R.id.action_tags).setVisible(have);
+        menu.findItem(R.id.action_add).setVisible(have);
+        menu.findItem(R.id.action_save_over).setVisible(have);
+        menu.findItem(R.id.action_undo).setVisible(have && AppState.canUndo());
+        MenuItem saveAs = menu.findItem(R.id.action_save_as);
+        saveAs.setVisible(have);
+        // Make "Save as…" prominent only while there is something to save.
+        saveAs.setShowAsAction(have && AppState.dirty
+                ? MenuItem.SHOW_AS_ACTION_IF_ROOM : MenuItem.SHOW_AS_ACTION_NEVER);
         return super.onPrepareOptionsMenu(menu);
     }
 
@@ -260,6 +395,18 @@ public class MainActivity extends AppCompatActivity {
         int id = item.getItemId();
         if (id == R.id.action_open) {
             pickFile();
+            return true;
+        } else if (id == R.id.action_add) {
+            editing.add();
+            return true;
+        } else if (id == R.id.action_save_as) {
+            editing.saveAs();
+            return true;
+        } else if (id == R.id.action_save_over) {
+            editing.saveOverOriginal();
+            return true;
+        } else if (id == R.id.action_undo) {
+            editing.undo();
             return true;
         } else if (id == R.id.action_play) {
             Intent i = new Intent(this, PreviewActivity.class);

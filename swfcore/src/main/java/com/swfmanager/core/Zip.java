@@ -33,7 +33,11 @@ public final class Zip {
     }
 
     public static byte[] deflate(byte[] src, int off, int len) {
-        Deflater def = new Deflater(Deflater.BEST_COMPRESSION);
+        return deflate(src, off, len, Deflater.BEST_COMPRESSION);
+    }
+
+    public static byte[] deflate(byte[] src, int off, int len, int level) {
+        Deflater def = new Deflater(level);
         def.setInput(src, off, len);
         def.finish();
         ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, len / 2));

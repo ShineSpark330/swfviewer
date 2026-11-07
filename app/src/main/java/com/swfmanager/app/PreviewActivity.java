@@ -5,6 +5,7 @@ import android.media.MediaPlayer;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.widget.Button;
@@ -35,6 +36,9 @@ public class PreviewActivity extends AppCompatActivity {
     private Button playPause;
     private SeekBar seek;
 
+    private Editing editing;
+    private Asset current;
+
     private MediaPlayer player;
     private boolean playerReady;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -64,6 +68,14 @@ public class PreviewActivity extends AppCompatActivity {
         playPause = findViewById(R.id.playPause);
         seek = findViewById(R.id.seek);
 
+        // Edits made here change the whole file, so the preview closes and the list refreshes.
+        editing = new Editing(this, new Editing.Listener() {
+            @Override
+            public void onChanged() {
+                finish();
+            }
+        });
+
         SwfDocument doc = AppState.doc;
         int idx = getIntent().getIntExtra(EXTRA_ASSET, -2);
         if (doc == null || idx < -1 || idx >= doc.assets.size()) {
@@ -80,6 +92,7 @@ public class PreviewActivity extends AppCompatActivity {
         }
 
         Asset a = doc.assets.get(idx);
+        current = a;
         setTitle(a.title());
         details.setText(doc.details(a));
         switch (a.type) {
@@ -307,6 +320,7 @@ public class PreviewActivity extends AppCompatActivity {
         super.onDestroy();
         handler.removeCallbacksAndMessages(null);
         exec.shutdown();
+        if (editing != null) editing.close();
         if (player != null) {
             player.release();
             player = null;
@@ -314,9 +328,34 @@ public class PreviewActivity extends AppCompatActivity {
     }
 
     @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        getMenuInflater().inflate(R.menu.preview_menu, menu);
+        return true;
+    }
+
+    @Override
+    public boolean onPrepareOptionsMenu(Menu menu) {
+        boolean have = current != null;
+        menu.findItem(R.id.action_rename).setVisible(have && Editing.canRename(current));
+        menu.findItem(R.id.action_replace).setVisible(have && Editing.canReplace(current));
+        menu.findItem(R.id.action_delete).setVisible(have);
+        return super.onPrepareOptionsMenu(menu);
+    }
+
+    @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == android.R.id.home) {
+        int id = item.getItemId();
+        if (id == android.R.id.home) {
             finish();
+            return true;
+        } else if (current != null && id == R.id.action_rename) {
+            editing.rename(current);
+            return true;
+        } else if (current != null && id == R.id.action_replace) {
+            editing.replace(current);
+            return true;
+        } else if (current != null && id == R.id.action_delete) {
+            editing.delete(current);
             return true;
         }
         return super.onOptionsItemSelected(item);
