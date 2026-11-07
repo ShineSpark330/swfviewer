@@ -1,0 +1,138 @@
+# Builds an installable Android APK (debug-signed) on GitHub's servers.
+#
+# How to use: GitHub -> Actions -> "Android APK" -> Run workflow. It also runs
+# on pushes to main, except ones that only change os.7z. When the run is green, open it and download the
+# "OceansSymphony-debug-apk" file from the Artifacts section at the bottom.
+# Unzip that download on your phone and install the .apk inside.
+#
+# This is a DEBUG build: signed with a throwaway key, not for the Play Store.
+# Because it uses the same app id as the Play/TWA install, Android will refuse
+# to install it OVER an existing copy ("App not installed" / signature
+# conflict). Export a backup from Settings -> Data first, uninstall the old
+# copy, then install this one and restore the backup.
+
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    # Uploading only os.7z (before it's extracted) has nothing to build, so
+    # skip it. A push that also changes other files (the extracted project)
+    # still builds.
+    paths-ignore:
+      - 'os.7z'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Stamp the run with the versions actually in this commit, so it is
+      # obvious which build an APK came from (also names the artifact).
+      - name: Show build version
+        run: |
+          APPV=$(grep -oP 'APP_VERSION = "\K[^"]+' src/lib/appVersion.js)
+          GRADLEV=$(grep -oP 'versionName "\K[^"]+' android/app/build.gradle)
+          GRADLEC=$(grep -oP 'versionCode \K[0-9]+' android/app/build.gradle)
+          echo "VER=$APPV" >> "$GITHUB_ENV"
+          {
+            echo "### Built app v$APPV"
+            echo "- src/lib/appVersion.js: \`$APPV\`"
+            echo "- android/app/build.gradle: versionName \`$GRADLEV\`, versionCode \`$GRADLEC\`"
+            echo "- commit: \`${GITHUB_SHA::7}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "App v$APPV | gradle $GRADLEV ($GRADLEC) | commit ${GITHUB_SHA::7}"
+
+      # build.gradle is what Android shows as the app's version, and nothing in
+      # this workflow updated it, so a stale value in the repo (e.g. 0.258) kept
+      # shipping even though src/lib/appVersion.js said 0.270. Force it to match.
+      - name: Force Gradle version to match appVersion.js
+        run: |
+          FILE=android/app/build.gradle
+          CORE="${VER%%[-+]*}"
+          IFS=. read -r A B C <<< "$CORE"
+          NEW=$(( 10#${A:-0} * 1000000 + 10#${B:-0} * 1000 + 10#${C:-0} ))
+          OLD=$(grep -oP 'versionCode \K[0-9]+' "$FILE")
+          CODE=$(( NEW > OLD ? NEW : OLD ))
+          sed -i -E "s/versionName \"[^\"]*\"/versionName \"$VER\"/; s/versionCode [0-9]+/versionCode $CODE/" "$FILE"
+          grep -q "versionName \"$VER\"" "$FILE" || { echo "Could not set versionName in $FILE" >&2; exit 1; }
+          echo "build.gradle -> versionName $VER, versionCode $CODE (was $OLD)"
+          echo "- forced build.gradle to versionName \`$VER\`, versionCode \`$CODE\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Sync into the Android project
+        run: npx cap sync android
+
+      # Fixes "error: package R does not exist" in MediaKeepAliveService.java.
+      # The generated R class lives in the Gradle `namespace`. If that differs
+      # from the Java file's package, R is not visible without an import, so
+      # add the import automatically.
+      - name: Make R resolve in MediaKeepAliveService
+        run: |
+          SRC=$(find android/app/src/main/java -name MediaKeepAliveService.java | head -1)
+          [ -n "$SRC" ] || { echo "MediaKeepAliveService.java not found, skipping"; exit 0; }
+          NS=$(grep -oP "namespace\s*=?\s*['\"]\K[^'\"]+" android/app/build.gradle | head -1)
+          PKG=$(grep -oP '^package\s+\K[^;\s]+' "$SRC")
+          echo "gradle namespace: ${NS:-<none>} | java package: $PKG"
+          [ -n "$NS" ] || { echo "No namespace found in build.gradle, skipping"; exit 0; }
+          if [ "$NS" != "$PKG" ] && ! grep -q "^import $NS\.R;" "$SRC"; then
+            sed -i "0,/^package .*;/s//&\n\nimport $NS.R;/" "$SRC"
+            echo "Added: import $NS.R;"
+            echo "- added \`import $NS.R;\` to MediaKeepAliveService.java" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No import needed"
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-36 build-tools;36.0.0"
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean assembleDebug --no-daemon
+
+      - name: Verify the APK reports the right version
+        run: |
+          APK=$(ls android/app/build/outputs/apk/debug/*.apk | head -1)
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          GOT=$("$AAPT2" dump badging "$APK" | grep -oP "versionName='\K[^']+" | head -1)
+          echo "APK versionName: $GOT (expected $VER)"
+          [ "$GOT" = "$VER" ] || { echo "Version mismatch in built APK" >&2; exit 1; }
+
+      - name: Keep the APK as a run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OceansSymphony-debug-apk-v${{ env.VER }}
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
