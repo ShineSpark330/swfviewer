@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:id="@+id/action_open"
+        android:title="Open SWF…"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/action_play"
+        android:title="Play movie"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_tags"
+        android:title="Raw tag list"
+        app:showAsAction="never" />
+</menu>
